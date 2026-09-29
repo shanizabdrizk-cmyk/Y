@@ -1,0 +1,214 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # Firewall rule
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # Restart RDP service
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Fixed Password
+        run: |
+          $password = "12345qwertQW@2"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          # Delete existing user if exists
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+              Remove-LocalUser -Name "RDP"
+          }
+
+          # Create user
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+
+          # Add permissions
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+          # Save credentials
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+
+          # Verify
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+
+          Start-Process msiexec.exe `
+            -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" `
+            -Wait
+
+          Remove-Item $installerPath -Force
+
+      - name: Install VS Code
+        run: |
+          choco install vscode -y
+
+          Start-Sleep -Seconds 15
+
+          if (!(Test-Path "C:\Program Files\Microsoft VS Code\Code.exe")) {
+              Write-Error "VS Code installation failed"
+              exit 1
+          }
+
+          Write-Host "VS Code installed successfully!"
+
+      - name: Install XAMPP
+        run: |
+          choco install xampp-81 -y
+
+          Start-Sleep -Seconds 20
+
+          if (!(Test-Path "C:\xampp")) {
+              Write-Error "XAMPP installation failed"
+              exit 1
+          }
+
+          Write-Host "XAMPP installed successfully!"
+
+      - name: Add PHP and Composer to PATH
+        run: |
+          $newPaths = @(
+            "C:\xampp\php",
+            "C:\Users\RDP\AppData\Roaming\Composer\vendor\bin"
+          )
+
+          $currentMachinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+
+          foreach ($path in $newPaths) {
+            if ($currentMachinePath -notlike "*$path*") {
+              $currentMachinePath += ";$path"
+            }
+          }
+
+          [Environment]::SetEnvironmentVariable(
+            "Path",
+            $currentMachinePath,
+            "Machine"
+          )
+
+          Write-Host "PATH updated successfully!"
+
+      - name: Enable PHP Extensions
+        run: |
+          $phpIni = "C:\tools\php\php.ini"
+
+          if (!(Test-Path $phpIni)) {
+              Write-Error "php.ini not found at $phpIni"
+              exit 1
+          }
+
+          # Enable extensions
+          (Get-Content $phpIni) `
+            -replace '^;extension=fileinfo', 'extension=fileinfo' `
+            -replace '^;extension=mysqli', 'extension=mysqli' |
+            Set-Content $phpIni
+
+          Write-Host "PHP extensions enabled successfully!"
+
+      - name: Create Laravel Project
+        run: |
+          # Install Composer
+          choco install composer -y
+
+          Start-Sleep -Seconds 10
+
+          # Go to htdocs
+          Set-Location "C:\xampp\htdocs"
+
+          # Remove existing project if exists
+          if (Test-Path "example") {
+              Remove-Item "example" -Recurse -Force
+          }
+
+          # Create Laravel project
+          composer create-project laravel/laravel example
+
+          # Verify
+          if (!(Test-Path "C:\xampp\htdocs\example\artisan")) {
+              Write-Error "Laravel project creation failed"
+              exit 1
+          }
+
+          Write-Host "Laravel project created successfully!"
+
+      - name: Establish Tailscale Connection
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey=${{ secrets.K4 }} `
+            --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          # Wait for IP
+          $tsIP = $null
+          $retries = 0
+
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned"
+              exit 1
+          }
+
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+
+          $testResult = Test-NetConnection `
+            -ComputerName $env:TAILSCALE_IP `
+            -Port 3389
+
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to port 3389 failed"
+              exit 1
+          }
+
+          Write-Host "TCP connectivity successful!"
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: 12345qwertQW@2"
+          Write-Host "Laravel Path: C:\xampp\htdocs\example"
+          Write-Host "==================`n"
+
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active"
+              Start-Sleep -Seconds 300
+          }
